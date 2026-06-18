@@ -1,0 +1,12 @@
+# Makefile.test — Member 2 standalone build (Raspberry Pi only)
+# Usage: make -f Makefile.test
+# Cleans: make -f Makefile.test clean
+
+obj-m += member2_test.o
+member2_test-objs := member2_test_stub.o
+
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
