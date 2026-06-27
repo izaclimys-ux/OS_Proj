@@ -1,0 +1,11 @@
+# /etc/udev/rules.d/99-kb-analytics.rules
+#
+# Trigger the kb_analytics setup script whenever any USB device is
+# connected.  The RUN directive is executed as root by udevd.
+#
+# Install:
+#   sudo cp 99-kb-analytics.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#
+ACTION=="add", SUBSYSTEM=="usb", \
+    RUN+="/bin/bash /opt/kb_analytics/run.sh udev_hotplug"
