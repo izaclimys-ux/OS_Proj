@@ -12,12 +12,14 @@ A Linux Loadable Kernel Module (LKM) for Raspberry Pi that:
 
 ```
 kb_analytics/
-├── kb_module.c          # Kernel module (LKM)
-├── userspace_app.c      # User-space C program (write/read hello-world)
-├── Makefile             # Builds both .ko and userspace binary
-├── run.sh               # Automation script (build → insmod → run → dmesg → stats)
-├── 99-kb-analytics.rules# udev rule for USB hotplug auto-trigger
-└── README.md            # This file
+├── kb_module.c            # Kernel module (LKM)
+├── userspace_app.c        # User-space C program (write/read hello-world)
+├── Makefile               # Builds both .ko and userspace binary
+├── run.sh                 # Automation script (build → insmod → run → dmesg → stats → dashboard)
+├── dashboard_server.py    # TLS HTTPS dashboard server (Python, no dependencies)
+├── gen_certs.sh           # Generates self-signed TLS cert + key into certs/
+├── 99-kb-analytics.rules  # udev rule for USB hotplug auto-trigger
+└── README.md              # This file
 ```
 
 ---
@@ -113,13 +115,35 @@ dmesg | tail -20
 
 ---
 
+## Live TLS Dashboard
+
+The dashboard server reads `/proc/kb_stats` every 2 seconds and serves a live HTTPS page. **Data is never written to disk** — only held in memory.
+
+```bash
+# Generate TLS certificate (one-time)
+bash gen_certs.sh
+
+# Start the dashboard server
+python3 dashboard_server.py
+
+# Then open on your laptop browser:
+# https://<pi-ip>:5000
+```
+
+Accept the self-signed certificate warning in your browser once.  
+The dashboard shows: total key presses, typing speed (kpm), avg interval, hotkey combos, top-10 keys with bar chart, and live time-series charts.
+
+---
+
 ## Sub-commands
 
 ```bash
-sudo ./run.sh              # Full setup (default)
-sudo ./run.sh stats        # Show /proc/kb_stats only
-sudo ./run.sh unload       # Remove the kernel module
-sudo ./run.sh udev_hotplug # (called by udev automatically)
+sudo ./run.sh                  # Full setup (default) — includes dashboard
+sudo ./run.sh stats            # Show /proc/kb_stats only
+sudo ./run.sh dashboard        # Generate certs + start dashboard only
+sudo ./run.sh stop-dashboard   # Stop the dashboard server
+sudo ./run.sh unload           # Remove the kernel module
+sudo ./run.sh udev_hotplug     # (called by udev automatically)
 ```
 
 ---

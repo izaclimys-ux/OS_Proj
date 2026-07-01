@@ -173,6 +173,79 @@ cmd_udev_hotplug() {
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 6: Generate TLS certificates (if not already present)
+# ─────────────────────────────────────────────────────────────────────────────
+step_gen_certs() {
+    section "Step 6: TLS Certificate Generation"
+
+    if [[ -f "${SCRIPT_DIR}/certs/server.crt" && -f "${SCRIPT_DIR}/certs/server.key" ]]; then
+        success "TLS certificates already exist — skipping generation."
+        return
+    fi
+
+    if ! command -v openssl &>/dev/null; then
+        warn "openssl not found. Installing..."
+        apt-get install -y openssl
+    fi
+
+    info "Running: gen_certs.sh"
+    bash "${SCRIPT_DIR}/gen_certs.sh"
+    success "TLS certificates generated."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 7: Launch the TLS dashboard server
+# ─────────────────────────────────────────────────────────────────────────────
+step_launch_dashboard() {
+    section "Step 7: Launch TLS Dashboard Server"
+
+    # Kill any old instance
+    pkill -f "dashboard_server.py" 2>/dev/null || true
+    sleep 0.5
+
+    if ! command -v python3 &>/dev/null; then
+        warn "python3 not found. Installing..."
+        apt-get install -y python3
+    fi
+
+    PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+
+    info "Starting dashboard_server.py in the background..."
+    nohup python3 "${SCRIPT_DIR}/dashboard_server.py" \
+        > "${SCRIPT_DIR}/dashboard.log" 2>&1 &
+    DASH_PID=$!
+    echo "${DASH_PID}" > "${SCRIPT_DIR}/dashboard.pid"
+
+    sleep 1   # give it a moment to bind
+
+    if kill -0 "${DASH_PID}" 2>/dev/null; then
+        success "Dashboard running (PID ${DASH_PID})"
+        echo ""
+        echo -e "  ${BOLD}Open in your laptop browser:${NC}"
+        echo -e "  ${GREEN}https://${PI_IP}:5000${NC}"
+        echo ""
+        echo -e "  ${YELLOW}Note:${NC} Accept the self-signed certificate warning once."
+        echo -e "  Log: ${SCRIPT_DIR}/dashboard.log"
+    else
+        error "Dashboard failed to start. Check ${SCRIPT_DIR}/dashboard.log"
+        cat "${SCRIPT_DIR}/dashboard.log" 2>/dev/null || true
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stop dashboard subcommand
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_stop_dashboard() {
+    section "Stopping Dashboard"
+    if pkill -f "dashboard_server.py" 2>/dev/null; then
+        success "Dashboard stopped."
+    else
+        warn "Dashboard was not running."
+    fi
+    rm -f "${SCRIPT_DIR}/dashboard.pid"
+}
+
 SUBCOMMAND="${1:-full}"
 
 case "${SUBCOMMAND}" in
@@ -186,12 +259,24 @@ case "${SUBCOMMAND}" in
         step_run_userspace
         step_dmesg
         step_stats
+        step_gen_certs
+        step_launch_dashboard
         echo -e "\n${GREEN}${BOLD}All steps completed successfully!${NC}"
-        echo -e "Tip: keep typing and then run   ${CYAN}sudo ./run.sh stats${NC}   to see updated analytics.\n"
+        echo -e "Tip: run   ${CYAN}sudo ./run.sh stats${NC}   to see analytics."
+        echo -e "     run   ${CYAN}sudo ./run.sh stop-dashboard${NC}   to stop the server.\n"
         ;;
     stats)
         require_root
         step_stats
+        ;;
+    dashboard)
+        require_root
+        step_gen_certs
+        step_launch_dashboard
+        ;;
+    stop-dashboard)
+        require_root
+        cmd_stop_dashboard
         ;;
     unload)
         cmd_unload
@@ -200,7 +285,7 @@ case "${SUBCOMMAND}" in
         cmd_udev_hotplug
         ;;
     *)
-        echo "Usage: sudo $0 [full|stats|unload|udev_hotplug]"
+        echo "Usage: sudo $0 [full|stats|dashboard|stop-dashboard|unload|udev_hotplug]"
         exit 1
         ;;
 esac
