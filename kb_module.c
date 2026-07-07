@@ -35,7 +35,10 @@ MODULE_VERSION("1.0");
  * ────────────────────────────────────────────── */
 #define DEVICE_NAME   "kb_analytics"
 #define CLASS_NAME    "kb_class"
-#define BUF_SIZE      256
+#define BUF_SIZE      512   /* enlarged so GET_STATS response fits comfortably */
+
+/* Command keyword that triggers the analytics read path */
+#define CMD_GET_STATS "GET_STATS"
 
 static int    major_number;
 static struct class  *kb_class  = NULL;
@@ -223,27 +226,160 @@ static int dev_release(struct inode *inodep, struct file *filep)
     return 0;
 }
 
-/* User space → kernel: receive a text message */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * dev_write — receive a command from user space and prepare the kernel reply.
+ *
+ * Two supported commands:
+ *   "GET_STATS"  — snapshot live keyboard analytics (total presses, typing
+ *                  speed in kpm, avg key interval, hotkey count, top-3 keys)
+ *                  and format them into tx_buf using snprintf().  The next
+ *                  read() call will deliver this data to user space via
+ *                  copy_to_user().
+ *   (anything)   — classic "Hello World from the kernel space" reply, required
+ *                  by the assignment specification.
+ *
+ * In both paths, the file position (*offset / filep->f_pos) is reset to 0 so
+ * that the immediately following read() always starts at the beginning of the
+ * freshly prepared tx_buf.  This makes the write→read pair a clean, repeatable
+ * command-response protocol without requiring a seek() in between.
+ *
+ * Locking strategy (two-phase, no nested locks):
+ *   Phase 1 — buf_lock only: copy_from_user into rx_buf, stash a local copy.
+ *   Phase 2a — analytics_lock only: snapshot counters & compute top-3 keys.
+ *   Phase 2b — buf_lock only: write formatted result into tx_buf.
+ * The two spinlocks are never held simultaneously, preventing any potential
+ * deadlock.
+ * ──────────────────────────────────────────────────────────────────────────── */
 static ssize_t dev_write(struct file *filep, const char __user *buf,
                          size_t len, loff_t *offset)
 {
     unsigned long flags;
+    /* Limit copy length to leave room for the null terminator */
     size_t copy_len = min(len, (size_t)(BUF_SIZE - 1));
+    /* Local copy of the command — held outside buf_lock so we can inspect it
+     * freely before deciding which lock(s) to acquire next */
+    char local_cmd[BUF_SIZE];
 
+    /* ── Phase 1: copy the user-space command into the kernel rx_buf ────────
+     * copy_from_user() handles the user→kernel address-space crossing safely.
+     * It returns the number of bytes NOT copied (0 on full success). */
     spin_lock_irqsave(&buf_lock, flags);
     if (copy_from_user(rx_buf, buf, copy_len)) {
         spin_unlock_irqrestore(&buf_lock, flags);
         return -EFAULT;
     }
-    rx_buf[copy_len] = '\0';
+    rx_buf[copy_len] = '\0';                    /* always null-terminate */
+    memcpy(local_cmd, rx_buf, copy_len + 1);   /* save a local copy for inspection */
     pr_info("kb_analytics: received from user space: %s\n", rx_buf);
+    spin_unlock_irqrestore(&buf_lock, flags);   /* release buf_lock before branching */
 
-    /* Prepare the kernel-space reply */
-    snprintf(tx_buf, BUF_SIZE, "Hello World from the kernel space");
-    tx_len = strlen(tx_buf);
-    spin_unlock_irqrestore(&buf_lock, flags);
+    /* ── Phase 2: build the response depending on the received command ──────
+     *
+     * We split into two branches here so the GET_STATS path can acquire
+     * analytics_lock independently — never while buf_lock is held. */
 
-    return (ssize_t)copy_len;
+    if (strncmp(local_cmd, CMD_GET_STATS, strlen(CMD_GET_STATS)) == 0) {
+
+        /* ── GET_STATS: expose live analytics to user space ─────────────────
+         *
+         * This is the core of Member 2's advanced feature: the kernel
+         * formats real-time data using snprintf() and places it in tx_buf.
+         * copy_to_user() in dev_read() then delivers it safely to user space.
+         *
+         * Without GET_STATS, the char device only ever sent the fixed
+         * "Hello World" string; now it acts as a genuine data interface. */
+
+        unsigned long al_flags;
+        unsigned long total, sum_us, cnt, hkcount;
+        unsigned long kpm = 0, avg_us = 0;
+        unsigned int  top_code[3]  = {0, 0, 0};  /* top-3 key codes  */
+        unsigned long top_count[3] = {0, 0, 0};  /* top-3 press counts */
+        bool          used[NUM_KEYS];
+        char          tmp[BUF_SIZE];   /* local staging buffer for snprintf */
+        int           tmp_len;
+        int           i, rank;
+
+        /* 2a. Atomically snapshot the analytics counters ─────────────────── */
+        spin_lock_irqsave(&analytics_lock, al_flags);
+
+        total   = total_keypresses;
+        sum_us  = interval_sum_us;
+        cnt     = interval_count;
+        hkcount = hotkey_count;
+
+        /* Typing speed: average inter-key interval → keys-per-minute
+         * Guard against division by zero when fewer than 2 intervals exist. */
+        if (cnt > 1) {
+            avg_us = sum_us / (cnt - 1);   /* mean interval in microseconds */
+            kpm    = (avg_us > 0) ? (60000000UL / avg_us) : 0;
+        }
+
+        /* Top-3 most-pressed keys — simple selection scan over key_counts[].
+         * used[] prevents the same keycode from appearing in multiple ranks. */
+        memset(used, 0, sizeof(used));
+        for (rank = 0; rank < 3; rank++) {
+            unsigned long best   = 0;
+            int           best_c = -1;
+            for (i = 0; i < NUM_KEYS; i++) {
+                if (!used[i] && key_counts[i] > best) {
+                    best   = key_counts[i];
+                    best_c = i;
+                }
+            }
+            if (best_c >= 0) {
+                top_code[rank]  = (unsigned int)best_c;
+                top_count[rank] = best;
+                used[best_c]    = true;   /* exclude from future ranks */
+            }
+        }
+        spin_unlock_irqrestore(&analytics_lock, al_flags);
+
+        /* 2b. Format the snapshot into a compact, parseable string ─────────
+         *
+         * snprintf() is used here for two safety reasons:
+         *   1. It NEVER writes beyond the specified buffer size (BUF_SIZE),
+         *      preventing any kernel buffer overflow.
+         *   2. It always null-terminates the result even when truncating.
+         *
+         * Format: "STATS: presses=N kpm=N avg_us=N hotkeys=N top=[C:N C:N C:N]"
+         * where C is a Linux keycode (e.g., 30=A, 57=SPACE, 28=ENTER). */
+        tmp_len = snprintf(tmp, sizeof(tmp),
+            "STATS: presses=%lu kpm=%lu avg_us=%lu hotkeys=%lu "
+            "top=[%u:%lu %u:%lu %u:%lu]",
+            total, kpm, avg_us, hkcount,
+            top_code[0], top_count[0],
+            top_code[1], top_count[1],
+            top_code[2], top_count[2]);
+
+        /* 2c. Move the formatted stats into the shared tx_buf ───────────────
+         * Reacquire buf_lock now that the data is ready in the local tmp[].
+         * min_t() ensures we never copy more bytes than BUF_SIZE allows. */
+        spin_lock_irqsave(&buf_lock, flags);
+        memcpy(tx_buf, tmp, (size_t)min_t(int, tmp_len + 1, BUF_SIZE));
+        tx_len  = min_t(int, tmp_len, BUF_SIZE - 1);
+        *offset = 0;   /* reset file position → next read() delivers from byte 0 */
+        spin_unlock_irqrestore(&buf_lock, flags);
+
+        pr_info("kb_analytics: GET_STATS → presses=%lu kpm=%lu hotkeys=%lu "
+                "top=[%u:%lu %u:%lu %u:%lu]\n",
+                total, kpm, hkcount,
+                top_code[0], top_count[0],
+                top_code[1], top_count[1],
+                top_code[2], top_count[2]);
+
+    } else {
+
+        /* ── Default: hello-world reply required by the assignment spec ─────
+         * Any write() that is NOT "GET_STATS" triggers the classic exchange:
+         * "Hello World from the user space" → "Hello World from the kernel space" */
+        spin_lock_irqsave(&buf_lock, flags);
+        snprintf(tx_buf, BUF_SIZE, "Hello World from the kernel space");
+        tx_len  = (int)strlen(tx_buf);
+        *offset = 0;   /* reset file position → next read() delivers from byte 0 */
+        spin_unlock_irqrestore(&buf_lock, flags);
+    }
+
+    return (ssize_t)copy_len;   /* report how many bytes we accepted */
 }
 
 /* Kernel → user space: send the prepared reply */

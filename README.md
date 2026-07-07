@@ -150,15 +150,39 @@ sudo ./run.sh udev_hotplug     # (called by udev automatically)
 
 ## How the write()/read() Exchange Works
 
+### Part 1 — Hello-world (assignment baseline)
+
 ```
 User space                         Kernel space
 ──────────                         ────────────
 open("/dev/kb_analytics")    ──►   dev_open()
-write("Hello World from      ──►   dev_write()  → stores msg, prepares reply,
-       the user space")                            logs via pr_info()
-read()                       ◄──   dev_read()   → returns "Hello World from
-                                                   the kernel space"
+write("Hello World from      ──►   dev_write()  → copy_from_user(), prepares reply,
+       the user space")                            resets f_pos to 0, logs via pr_info()
+read()                       ◄──   dev_read()   → copy_to_user() returns
+                                                   "Hello World from the kernel space"
 ```
+
+### Part 2 — GET_STATS (advanced feature: live analytics via char device)
+
+```
+User space                         Kernel space
+──────────                         ────────────
+write("GET_STATS")           ──►   dev_write()  → acquires analytics_lock,
+                                                   snapshots total presses / kpm /
+                                                   avg interval / hotkeys / top-3 keys,
+                                                   formats with snprintf() into tx_buf,
+                                                   resets f_pos to 0
+read()                       ◄──   dev_read()   → copy_to_user() returns compact
+                                                   analytics string, e.g.:
+                              "STATS: presses=42 kpm=120 avg_us=500000
+                               hotkeys=3 top=[30:15 57:10 18:8]"
+```
+
+Key-code reference: `30=A  31=S  32=D  18=E  20=T  57=SPACE  28=ENTER  14=BACKSPACE`
+
+The kernel resets the file position (`f_pos`) to 0 in `dev_write()` after every command,
+so the next `read()` always starts from the beginning of the freshly prepared reply —
+no `lseek()` required between Part 1 and Part 2.
 
 The kernel logs both sides via `pr_info()`, visible with `dmesg`.
 
