@@ -32,11 +32,15 @@ module:
 
 # ── User-space application ──────────────────────────────────────
 .PHONY: userspace
-userspace: userspace_app
-	@echo ">>> User-space binary built successfully."
+userspace: userspace_app mmap_reader
+	@echo ">>> User-space binaries built successfully."
 
 userspace_app: userspace_app.c
 	@echo ">>> Compiling userspace_app.c with gcc ..."
+	$(CC) $(CFLAGS) -o $@ $<
+
+mmap_reader: mmap_reader.c
+	@echo ">>> Compiling mmap_reader.c with gcc ..."
 	$(CC) $(CFLAGS) -o $@ $<
 
 # ── Clean ───────────────────────────────────────────────────────
@@ -44,5 +48,5 @@ userspace_app: userspace_app.c
 clean:
 	@echo ">>> Cleaning build artefacts ..."
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f userspace_app
+	rm -f userspace_app mmap_reader
 	@echo ">>> Clean done."

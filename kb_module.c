@@ -29,6 +29,7 @@
 #include <linux/sched.h>
 #include <linux/atomic.h>
 #include <linux/fcntl.h>
+#include <linux/mm.h>        /* remap_pfn_range(), VM_* flags for mmap() */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KB Analytics Project");
@@ -92,6 +93,51 @@ static unsigned long hotkey_count;           /* any Ctrl/Alt combo       */
 static DEFINE_SPINLOCK(analytics_lock);
 
 /* ──────────────────────────────────────────────
+ * mmap() Shared Statistics Page (Virtual Memory)
+ *
+ * Instead of using copy_to_user() every time the application requests
+ * statistics, the driver allocates a single page in kernel memory and
+ * allows user space to map that same page with mmap().
+ *
+ * This means the kernel and the user process have different virtual
+ * addresses that both point to the same physical memory page. The kernel
+ * updates the statistics directly, while the application can read the
+ * latest values immediately without making another system call or copying
+ * data between kernel and user space.
+ * ────────────────────────────────────────────── */
+struct kb_shared_stats {
+    __u64 total_presses;      /* running total of key presses          */
+    __u64 typing_speed_kpm;   /* keys per minute (derived)             */
+    __u64 avg_interval_us;    /* mean inter-key interval, microseconds */
+    __u64 hotkey_count;       /* Ctrl/Alt + key combos                 */
+    __u64 last_keycode;       /* most recent keycode pressed           */
+    __u32 seq;                /* reserved for stage-two seqlock        */
+    __u32 _pad;               /* explicit padding → predictable layout */
+};
+
+/* Page-aligned kernel buffer backing the user mapping. One page is far more
+ * than we need (the struct is ~48 bytes) but mmap() works in page units. */
+static struct kb_shared_stats *shared_stats;
+
+/* Copy the current analytics snapshot into the shared page. MUST be called
+ * with analytics_lock held (all callers already hold it), so the kernel-side
+ * writes are serialised against each other. */
+static void kb_update_shared_page(void)
+{
+    if (!shared_stats)
+        return;
+
+    shared_stats->total_presses = total_keypresses;
+    shared_stats->hotkey_count  = hotkey_count;
+
+    if (interval_count > 1) {
+        unsigned long avg_us = interval_sum_us / (interval_count - 1);
+        shared_stats->avg_interval_us  = avg_us;
+        shared_stats->typing_speed_kpm = avg_us ? (60000000UL / avg_us) : 0;
+    }
+}
+
+/* ──────────────────────────────────────────────
  * Input handler — taps into every keyboard event
  * ────────────────────────────────────────────── */
 static void kb_event(struct input_handle *handle,
@@ -144,6 +190,13 @@ static void kb_event(struct input_handle *handle,
             pr_info("kb_analytics: hotkey detected — ctrl=%d shift=%d alt=%d key=%u\n",
                     mod_ctrl, mod_shift, mod_alt, code);
         }
+
+        /* Mirror the fresh snapshot into the mmap-shared page so any user
+         * process that mapped /dev/kb_analytics sees the update immediately,
+         * with no read()/copy_to_user() round trip. Still under analytics_lock. */
+        if (shared_stats)
+            shared_stats->last_keycode = code;
+        kb_update_shared_page();
     }
 
     spin_unlock_irqrestore(&analytics_lock, flags);
@@ -486,6 +539,50 @@ static __poll_t dev_poll(struct file *filep, struct poll_table_struct *wait)
     return mask;
 }
 
+/*
+/* ──────────────────────────────────────────────
+ * mmap() Shared Statistics Page (Advanced Feature - Virtual Memory)
+ *
+ * Instead of calling copy_to_user() for every request, the driver
+ * allocates one kernel page and maps it into user space with mmap().
+ * Both the kernel and user process have different virtual addresses
+ * pointing to the same physical page, allowing user space to read the
+ * latest statistics directly without extra system calls or copying.
+ *
+ * remap_pfn_range() creates the user-space mapping, while fixed-width
+ * types keep the shared structure layout consistent across the ABI.
+ * The 'seq' field is reserved for future seqlock support.
+ * ────────────────────────────────────────────── */
+ */
+static int dev_mmap(struct file *filep, struct vm_area_struct *vma)
+{
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long pfn;
+
+    if (!shared_stats)
+        return -ENODEV;
+
+    /* Never let the mapping span more than the single page we own. */
+    if (size > PAGE_SIZE)
+        return -EINVAL;
+
+    /* Enforce a read-only view for user space. */
+    if (vma->vm_flags & VM_WRITE)
+        return -EPERM;
+
+    /* Physical frame number of our page-aligned kernel buffer. */
+    pfn = page_to_pfn(virt_to_page(shared_stats));
+
+    /* Install the user-side mapping: point vma->vm_start at our PFN. */
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        pr_err("kb_analytics: remap_pfn_range failed\n");
+        return -EAGAIN;
+    }
+
+    pr_info("kb_analytics: mmap — shared stats page mapped into user space\n");
+    return 0;
+}
+
 static const struct file_operations fops = {
     .owner   = THIS_MODULE,
     .open    = dev_open,
@@ -493,6 +590,7 @@ static const struct file_operations fops = {
     .read    = dev_read,
     .write   = dev_write,
     .poll    = dev_poll,
+    .mmap    = dev_mmap,
 };
 
 /* ──────────────────────────────────────────────
@@ -641,6 +739,17 @@ static int __init kb_module_init(void)
 
     pr_info("kb_analytics: loading module\n");
 
+    /* 0. Allocate the page-aligned shared stats buffer for mmap().
+     * get_zeroed_page() returns one physically-contiguous, page-aligned frame.
+     * SetPageReserved() marks it so the VM never reclaims or swaps it while a
+     * user process has it mapped — a requirement for remap_pfn_range() on RAM. */
+    shared_stats = (struct kb_shared_stats *)get_zeroed_page(GFP_KERNEL);
+    if (!shared_stats) {
+        pr_err("kb_analytics: failed to allocate shared stats page\n");
+        return -ENOMEM;
+    }
+    SetPageReserved(virt_to_page(shared_stats));
+
     /* 1. Allocate character device region */
     ret = alloc_chrdev_region(&kb_dev, 0, 1, DEVICE_NAME);
     if (ret < 0) {
@@ -710,6 +819,9 @@ err_device: device_destroy(kb_class, kb_dev);
 err_class:  class_destroy(kb_class);
 err_cdev:   cdev_del(&kb_cdev);
 err_region: unregister_chrdev_region(kb_dev, 1);
+            ClearPageReserved(virt_to_page(shared_stats));
+            free_page((unsigned long)shared_stats);
+            shared_stats = NULL;
     return ret;
 }
 
@@ -722,6 +834,14 @@ static void __exit kb_module_exit(void)
     class_destroy(kb_class);
     cdev_del(&kb_cdev);
     unregister_chrdev_region(kb_dev, 1);
+
+    /* Release the mmap-shared page (reverse of the init allocation). */
+    if (shared_stats) {
+        ClearPageReserved(virt_to_page(shared_stats));
+        free_page((unsigned long)shared_stats);
+        shared_stats = NULL;
+    }
+
     pr_info("kb_analytics: module unloaded\n");
 }
 
