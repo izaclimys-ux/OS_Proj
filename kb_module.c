@@ -24,6 +24,11 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/string.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
+#include <linux/atomic.h>
+#include <linux/fcntl.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KB Analytics Project");
@@ -53,6 +58,20 @@ static int    tx_len = 0;
 
 static DEFINE_SPINLOCK(buf_lock);
 
+/* poll()/blocking-read support: readers sleep on kb_waitq; each key press bumps
+ * kb_event_count. Per-open "last seen" count is stashed in filep->private_data. */
+static DECLARE_WAIT_QUEUE_HEAD(kb_waitq);
+static atomic_t kb_event_count = ATOMIC_INIT(0);
+
+static inline unsigned long kb_seen_get(struct file *filep)
+{
+    return (unsigned long)filep->private_data;
+}
+static inline void kb_seen_set(struct file *filep, unsigned long v)
+{
+    filep->private_data = (void *)v;
+}
+
 /* ──────────────────────────────────────────────
  * Keyboard analytics state
  * ────────────────────────────────────────────── */
@@ -80,6 +99,7 @@ static void kb_event(struct input_handle *handle,
 {
     ktime_t now;
     unsigned long flags;
+    bool pressed = false;
 
     /* Only care about key events; value 1 = press, 0 = release, 2 = repeat */
     if (type != EV_KEY)
@@ -96,6 +116,7 @@ static void kb_event(struct input_handle *handle,
         mod_alt   = (value != 0);
 
     if (value == 1) {   /* key press (not repeat, not release) */
+        pressed = true;
         if (code < NUM_KEYS)
             key_counts[code]++;
         total_keypresses++;
@@ -126,6 +147,12 @@ static void kb_event(struct input_handle *handle,
     }
 
     spin_unlock_irqrestore(&analytics_lock, flags);
+
+    /* Wake sleeping readers outside analytics_lock (softirq-safe). */
+    if (pressed) {
+        atomic_inc(&kb_event_count);
+        wake_up_interruptible(&kb_waitq);
+    }
 }
 
 static int kb_connect(struct input_handler *handler,
@@ -216,6 +243,8 @@ static struct usb_driver kb_usb_driver = {
  * ────────────────────────────────────────────── */
 static int dev_open(struct inode *inodep, struct file *filep)
 {
+    /* Seed "last seen" so poll()/read() only react to presses from now on. */
+    kb_seen_set(filep, (unsigned long)atomic_read(&kb_event_count));
     pr_info("kb_analytics: character device opened\n");
     return 0;
 }
@@ -382,27 +411,79 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
     return (ssize_t)copy_len;   /* report how many bytes we accepted */
 }
 
-/* Kernel → user space: send the prepared reply */
+/*
+ * dev_read — two modes:
+ *   A) unread reply pending (*offset < tx_len): deliver tx_buf as before
+ *      (GET_STATS / Hello-World path, unchanged).
+ *   B) nothing pending: O_NONBLOCK returns EOF; otherwise block until the next
+ *      key press and return a short activity line (kept out of tx_buf).
+ */
 static ssize_t dev_read(struct file *filep, char __user *buf,
                         size_t len, loff_t *offset)
 {
     unsigned long flags;
-    int ret;
+    unsigned long seen, now_cnt, total;
+    char act[96];
+    int  act_len, ret;
+
+    /* Mode A: deliver an outstanding command reply. */
+    spin_lock_irqsave(&buf_lock, flags);
+    if (*offset < tx_len) {
+        len = min(len, (size_t)(tx_len - (int)*offset));
+        ret = copy_to_user(buf, tx_buf + *offset, len);
+        if (ret) {
+            spin_unlock_irqrestore(&buf_lock, flags);
+            return -EFAULT;
+        }
+        *offset += len;
+        spin_unlock_irqrestore(&buf_lock, flags);
+        return (ssize_t)len;
+    }
+    spin_unlock_irqrestore(&buf_lock, flags);
+
+    /* Mode B: nothing pending. */
+    if (filep->f_flags & O_NONBLOCK)
+        return 0;
+
+    seen = kb_seen_get(filep);
+    ret = wait_event_interruptible(kb_waitq,
+                                   (unsigned long)atomic_read(&kb_event_count) != seen);
+    if (ret)
+        return -ERESTARTSYS;
+
+    now_cnt = (unsigned long)atomic_read(&kb_event_count);
+    kb_seen_set(filep, now_cnt);
+
+    spin_lock_irqsave(&analytics_lock, flags);
+    total = total_keypresses;
+    spin_unlock_irqrestore(&analytics_lock, flags);
+
+    act_len = snprintf(act, sizeof(act),
+                       "ACTIVITY: keypress detected (events=%lu, total=%lu)\n",
+                       now_cnt, total);
+    len = min(len, (size_t)act_len);
+    if (copy_to_user(buf, act, len))
+        return -EFAULT;
+    return (ssize_t)len;
+}
+
+/* dev_poll — readable when a new key press or an unread reply is available. */
+static __poll_t dev_poll(struct file *filep, struct poll_table_struct *wait)
+{
+    __poll_t mask = 0;
+    unsigned long flags;
+
+    poll_wait(filep, &kb_waitq, wait);
+
+    if ((unsigned long)atomic_read(&kb_event_count) != kb_seen_get(filep))
+        mask |= (EPOLLIN | EPOLLRDNORM);
 
     spin_lock_irqsave(&buf_lock, flags);
-    if (*offset >= tx_len) {
-        spin_unlock_irqrestore(&buf_lock, flags);
-        return 0;   /* EOF */
-    }
-    len = min(len, (size_t)(tx_len - (int)*offset));
-    ret = copy_to_user(buf, tx_buf + *offset, len);
-    if (ret) {
-        spin_unlock_irqrestore(&buf_lock, flags);
-        return -EFAULT;
-    }
-    *offset += len;
+    if (filep->f_pos < tx_len)
+        mask |= (EPOLLIN | EPOLLRDNORM);
     spin_unlock_irqrestore(&buf_lock, flags);
-    return (ssize_t)len;
+
+    return mask;
 }
 
 static const struct file_operations fops = {
@@ -411,6 +492,7 @@ static const struct file_operations fops = {
     .release = dev_release,
     .read    = dev_read,
     .write   = dev_write,
+    .poll    = dev_poll,
 };
 
 /* ──────────────────────────────────────────────
