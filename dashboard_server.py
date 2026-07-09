@@ -264,11 +264,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Charts row -->
 <div class="charts">
   <div class="chart-card">
-    <h2>Typing Speed Over Time (kpm)</h2>
+    <h2>Live Typing Speed (kpm) — drops to 0 when idle</h2>
     <canvas id="speedChart" height="160"></canvas>
   </div>
   <div class="chart-card">
-    <h2>Key Press Activity</h2>
+    <h2>Keys Pressed Per Interval — drops to 0 when idle</h2>
     <canvas id="pressChart" height="160"></canvas>
   </div>
 </div>
@@ -361,11 +361,18 @@ function renderTopKeys(keys) {
   }).join('');
 }
 
+// ── Delta tracking — so charts drop to 0 when typing stops ───────────────
+let lastTotal    = null;
+let lastHotkeys  = null;
+let lastPollTime = null;
+
 // ── Poll /api/stats every 2 seconds ──────────────────────────────────────
 async function fetchStats() {
   try {
     const res  = await fetch('/api/stats');
     const data = await res.json();
+
+    const now = Date.now();
 
     // Status badge
     const badge = document.getElementById('status-badge');
@@ -384,14 +391,32 @@ async function fetchStats() {
     document.getElementById('hotkeys').textContent  = data.hotkey_combos.toLocaleString();
     document.getElementById('last-update').textContent = `Last updated: ${data.last_updated}`;
 
-    // Time-series data
-    const label = data.last_updated || new Date().toLocaleTimeString();
+    // ── Delta calculations ─────────────────────────────────────────────
+    // Keys pressed since last poll — drops to 0 when typing stops
+    const deltaKeys = (lastTotal !== null)
+      ? Math.max(0, data.total_keypresses - lastTotal)
+      : 0;
+
+    // Live typing speed: keys/min derived from delta over elapsed time
+    // Falls to 0 immediately when no keys pressed this interval
+    let liveKpm = 0;
+    if (lastPollTime !== null && deltaKeys > 0) {
+      const elapsedMin = (now - lastPollTime) / 60000;
+      liveKpm = Math.round(deltaKeys / elapsedMin);
+    }
+
+    lastTotal    = data.total_keypresses;
+    lastHotkeys  = data.hotkey_combos;
+    lastPollTime = now;
+
+    // ── Time-series charts ─────────────────────────────────────────────
+    const label = new Date().toLocaleTimeString();
     if (timeLabels.length >= MAX_POINTS) {
       timeLabels.shift(); speedHistory.shift(); pressHistory.shift();
     }
     timeLabels.push(label);
-    speedHistory.push(data.typing_speed_kpm);
-    pressHistory.push(data.total_keypresses);
+    speedHistory.push(liveKpm);    // live kpm — goes to 0 when idle
+    pressHistory.push(deltaKeys);  // keys this interval — goes to 0 when idle
     speedChart.update();
     pressChart.update();
 
