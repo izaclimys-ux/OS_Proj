@@ -1,13 +1,3 @@
-#!/usr/bin/env bash
-# gen_certs.sh — Generate a self-signed TLS certificate for the dashboard
-#
-# Creates:
-#   certs/server.key  — private key  (never leaves the Pi)
-#   certs/server.crt  — certificate  (presented to the browser)
-#
-# The cert is valid for 825 days and includes the Pi's hostname and common
-# local IP ranges as Subject Alternative Names so modern browsers accept it.
-
 set -euo pipefail
 
 CERT_DIR="$(dirname "$0")/certs"

@@ -1,14 +1,3 @@
-/*
- * kb_module.c — Keyboard Analytics Loadable Kernel Module
- *
- * Features:
- *  - Detects USB device plug/unplug events
- *  - Exposes a character device (/dev/kb_analytics) for user-space read()/write()
- *  - Hooks into the Linux input subsystem to track keyboard events:
- *      key press counts, typing speed, most-used keys, hotkey combos
- *  - Reports analytics via /proc/kb_stats
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -72,9 +61,7 @@ static inline void kb_seen_set(struct file *filep, unsigned long v)
     filep->private_data = (void *)v;
 }
 
-/* ──────────────────────────────────────────────
- * Keyboard analytics state
- * ────────────────────────────────────────────── */
+// Keyboard analytics state
 #define NUM_KEYS  256
 
 static unsigned long key_counts[NUM_KEYS];   /* per-keycode press count  */
@@ -91,9 +78,7 @@ static unsigned long hotkey_count;           /* any Ctrl/Alt combo       */
 
 static DEFINE_SPINLOCK(analytics_lock);
 
-/* ──────────────────────────────────────────────
- * Input handler — taps into every keyboard event
- * ────────────────────────────────────────────── */
+// Input event handler
 static void kb_event(struct input_handle *handle,
                      unsigned int type, unsigned int code, int value)
 {
@@ -101,13 +86,13 @@ static void kb_event(struct input_handle *handle,
     unsigned long flags;
     bool pressed = false;
 
-    /* Only care about key events; value 1 = press, 0 = release, 2 = repeat */
+    // Only care about key events; value 1 = press, 0 = release, 2 = repeat
     if (type != EV_KEY)
         return;
 
     spin_lock_irqsave(&analytics_lock, flags);
 
-    /* Track modifier state */
+    // Track modifier state
     if (code == KEY_LEFTCTRL  || code == KEY_RIGHTCTRL)
         mod_ctrl  = (value != 0);
     if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT)
@@ -115,13 +100,13 @@ static void kb_event(struct input_handle *handle,
     if (code == KEY_LEFTALT   || code == KEY_RIGHTALT)
         mod_alt   = (value != 0);
 
-    if (value == 1) {   /* key press (not repeat, not release) */
+    if (value == 1) {
         pressed = true;
         if (code < NUM_KEYS)
             key_counts[code]++;
         total_keypresses++;
 
-        /* Typing speed: measure interval since last press */
+        // Typing speed: measure interval since last press
         now = ktime_get();
         if (interval_count > 0) {
             long delta_us = (long)ktime_to_us(ktime_sub(now, last_press_time));
@@ -134,7 +119,7 @@ static void kb_event(struct input_handle *handle,
         }
         last_press_time = now;
 
-        /* Hotkey detection: any non-modifier key pressed with Ctrl or Alt */
+        // Hotkey detection: any non-modifier key pressed with Ctrl or Alt
         if ((mod_ctrl || mod_alt) &&
             code != KEY_LEFTCTRL  && code != KEY_RIGHTCTRL &&
             code != KEY_LEFTALT   && code != KEY_RIGHTALT  &&
@@ -148,7 +133,7 @@ static void kb_event(struct input_handle *handle,
 
     spin_unlock_irqrestore(&analytics_lock, flags);
 
-    /* Wake sleeping readers outside analytics_lock (softirq-safe). */
+    // Wake sleeping readers outside analytics_lock (softirq-safe)
     if (pressed) {
         atomic_inc(&kb_event_count);
         wake_up_interruptible(&kb_waitq);
@@ -203,9 +188,7 @@ static struct input_handler kb_handler = {
     .id_table   = kb_ids,
 };
 
-/* ──────────────────────────────────────────────
- * USB hotplug notifier
- * ────────────────────────────────────────────── */
+// USB hotplug notifier
 static int kb_usb_probe(struct usb_interface *intf,
                         const struct usb_device_id *id)
 {
@@ -221,7 +204,7 @@ static void kb_usb_disconnect(struct usb_interface *intf)
     pr_info("kb_analytics: USB device unplugged\n");
 }
 
-/* Match all USB devices */
+// Match all USB devices
 static const struct usb_device_id kb_usb_table[] = {
     { USB_DEVICE_INFO(USB_CLASS_HID, 0, 0) },
     { USB_DEVICE_INFO(USB_CLASS_MASS_STORAGE, 0, 0) },
@@ -238,9 +221,7 @@ static struct usb_driver kb_usb_driver = {
     .id_table   = kb_usb_table,
 };
 
-/* ──────────────────────────────────────────────
- * Character device file operations
- * ────────────────────────────────────────────── */
+// Character device file operations
 static int dev_open(struct inode *inodep, struct file *filep)
 {
     /* Seed "last seen" so poll()/read() only react to presses from now on. */
@@ -255,30 +236,7 @@ static int dev_release(struct inode *inodep, struct file *filep)
     return 0;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * dev_write — receive a command from user space and prepare the kernel reply.
- *
- * Two supported commands:
- *   "GET_STATS"  — snapshot live keyboard analytics (total presses, typing
- *                  speed in kpm, avg key interval, hotkey count, top-3 keys)
- *                  and format them into tx_buf using snprintf().  The next
- *                  read() call will deliver this data to user space via
- *                  copy_to_user().
- *   (anything)   — classic "Hello World from the kernel space" reply, required
- *                  by the assignment specification.
- *
- * In both paths, the file position (*offset / filep->f_pos) is reset to 0 so
- * that the immediately following read() always starts at the beginning of the
- * freshly prepared tx_buf.  This makes the write→read pair a clean, repeatable
- * command-response protocol without requiring a seek() in between.
- *
- * Locking strategy (two-phase, no nested locks):
- *   Phase 1 — buf_lock only: copy_from_user into rx_buf, stash a local copy.
- *   Phase 2a — analytics_lock only: snapshot counters & compute top-3 keys.
- *   Phase 2b — buf_lock only: write formatted result into tx_buf.
- * The two spinlocks are never held simultaneously, preventing any potential
- * deadlock.
- * ──────────────────────────────────────────────────────────────────────────── */
+// dev_write — receive a command from user space and prepare the kernel reply.
 static ssize_t dev_write(struct file *filep, const char __user *buf,
                          size_t len, loff_t *offset)
 {
@@ -289,9 +247,7 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
      * freely before deciding which lock(s) to acquire next */
     char local_cmd[BUF_SIZE];
 
-    /* ── Phase 1: copy the user-space command into the kernel rx_buf ────────
-     * copy_from_user() handles the user→kernel address-space crossing safely.
-     * It returns the number of bytes NOT copied (0 on full success). */
+    // Phase 1: copy the user-space command into the kernel rx_buf
     spin_lock_irqsave(&buf_lock, flags);
     if (copy_from_user(rx_buf, buf, copy_len)) {
         spin_unlock_irqrestore(&buf_lock, flags);
@@ -302,22 +258,11 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
     pr_info("kb_analytics: received from user space: %s\n", rx_buf);
     spin_unlock_irqrestore(&buf_lock, flags);   /* release buf_lock before branching */
 
-    /* ── Phase 2: build the response depending on the received command ──────
-     *
-     * We split into two branches here so the GET_STATS path can acquire
-     * analytics_lock independently — never while buf_lock is held. */
+    // Phase 2: build the response depending on the received command
 
     if (strncmp(local_cmd, CMD_GET_STATS, strlen(CMD_GET_STATS)) == 0) {
 
-        /* ── GET_STATS: expose live analytics to user space ─────────────────
-         *
-         * This is the core of Member 2's advanced feature: the kernel
-         * formats real-time data using snprintf() and places it in tx_buf.
-         * copy_to_user() in dev_read() then delivers it safely to user space.
-         *
-         * Without GET_STATS, the char device only ever sent the fixed
-         * "Hello World" string; now it acts as a genuine data interface. */
-
+        // GET_STATS: expose live analytics to user space
         unsigned long al_flags;
         unsigned long total, sum_us, cnt, hkcount;
         unsigned long kpm = 0, avg_us = 0;
@@ -327,8 +272,7 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
         char          tmp[BUF_SIZE];   /* local staging buffer for snprintf */
         int           tmp_len;
         int           i, rank;
-
-        /* 2a. Atomically snapshot the analytics counters ─────────────────── */
+        
         spin_lock_irqsave(&analytics_lock, al_flags);
 
         total   = total_keypresses;
@@ -336,15 +280,13 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
         cnt     = interval_count;
         hkcount = hotkey_count;
 
-        /* Typing speed: average inter-key interval → keys-per-minute
-         * Guard against division by zero when fewer than 2 intervals exist. */
+        // Typing speed: average inter-key interval → keys-per-minute
         if (cnt > 1) {
-            avg_us = sum_us / (cnt - 1);   /* mean interval in microseconds */
+            avg_us = sum_us / (cnt - 1);
             kpm    = (avg_us > 0) ? (60000000UL / avg_us) : 0;
         }
 
-        /* Top-3 most-pressed keys — simple selection scan over key_counts[].
-         * used[] prevents the same keycode from appearing in multiple ranks. */
+        // Top-3 most-pressed keys — simple selection scan over key_counts[].
         memset(used, 0, sizeof(used));
         for (rank = 0; rank < 3; rank++) {
             unsigned long best   = 0;
@@ -363,15 +305,7 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
         }
         spin_unlock_irqrestore(&analytics_lock, al_flags);
 
-        /* 2b. Format the snapshot into a compact, parseable string ─────────
-         *
-         * snprintf() is used here for two safety reasons:
-         *   1. It NEVER writes beyond the specified buffer size (BUF_SIZE),
-         *      preventing any kernel buffer overflow.
-         *   2. It always null-terminates the result even when truncating.
-         *
-         * Format: "STATS: presses=N kpm=N avg_us=N hotkeys=N top=[C:N C:N C:N]"
-         * where C is a Linux keycode (e.g., 30=A, 57=SPACE, 28=ENTER). */
+        // Format the snapshot into a compact, parseable string
         tmp_len = snprintf(tmp, sizeof(tmp),
             "STATS: presses=%lu kpm=%lu avg_us=%lu hotkeys=%lu "
             "top=[%u:%lu %u:%lu %u:%lu]",
@@ -380,13 +314,11 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
             top_code[1], top_count[1],
             top_code[2], top_count[2]);
 
-        /* 2c. Move the formatted stats into the shared tx_buf ───────────────
-         * Reacquire buf_lock now that the data is ready in the local tmp[].
-         * min_t() ensures we never copy more bytes than BUF_SIZE allows. */
+        //Move the formatted stats into the shared tx_buf
         spin_lock_irqsave(&buf_lock, flags);
         memcpy(tx_buf, tmp, (size_t)min_t(int, tmp_len + 1, BUF_SIZE));
         tx_len  = min_t(int, tmp_len, BUF_SIZE - 1);
-        *offset = 0;   /* reset file position → next read() delivers from byte 0 */
+        *offset = 0;
         spin_unlock_irqrestore(&buf_lock, flags);
 
         pr_info("kb_analytics: GET_STATS → presses=%lu kpm=%lu hotkeys=%lu "
@@ -398,26 +330,17 @@ static ssize_t dev_write(struct file *filep, const char __user *buf,
 
     } else {
 
-        /* ── Default: hello-world reply required by the assignment spec ─────
-         * Any write() that is NOT "GET_STATS" triggers the classic exchange:
-         * "Hello World from the user space" → "Hello World from the kernel space" */
+        // hello-world reply
         spin_lock_irqsave(&buf_lock, flags);
         snprintf(tx_buf, BUF_SIZE, "Hello World from the kernel space");
         tx_len  = (int)strlen(tx_buf);
-        *offset = 0;   /* reset file position → next read() delivers from byte 0 */
+        *offset = 0;
         spin_unlock_irqrestore(&buf_lock, flags);
     }
 
-    return (ssize_t)copy_len;   /* report how many bytes we accepted */
+    return (ssize_t)copy_len;
 }
 
-/*
- * dev_read — two modes:
- *   A) unread reply pending (*offset < tx_len): deliver tx_buf as before
- *      (GET_STATS / Hello-World path, unchanged).
- *   B) nothing pending: O_NONBLOCK returns EOF; otherwise block until the next
- *      key press and return a short activity line (kept out of tx_buf).
- */
 static ssize_t dev_read(struct file *filep, char __user *buf,
                         size_t len, loff_t *offset)
 {
@@ -426,7 +349,7 @@ static ssize_t dev_read(struct file *filep, char __user *buf,
     char act[96];
     int  act_len, ret;
 
-    /* Mode A: deliver an outstanding command reply. */
+    // Mode A: deliver an outstanding command reply.
     spin_lock_irqsave(&buf_lock, flags);
     if (*offset < tx_len) {
         len = min(len, (size_t)(tx_len - (int)*offset));
@@ -441,7 +364,7 @@ static ssize_t dev_read(struct file *filep, char __user *buf,
     }
     spin_unlock_irqrestore(&buf_lock, flags);
 
-    /* Mode B: nothing pending. */
+    // Mode B: nothing pending
     if (filep->f_flags & O_NONBLOCK)
         return 0;
 
@@ -467,7 +390,7 @@ static ssize_t dev_read(struct file *filep, char __user *buf,
     return (ssize_t)len;
 }
 
-/* dev_poll — readable when a new key press or an unread reply is available. */
+// dev_poll — readable when a new key press or an unread reply is available
 static __poll_t dev_poll(struct file *filep, struct poll_table_struct *wait)
 {
     __poll_t mask = 0;
@@ -495,9 +418,8 @@ static const struct file_operations fops = {
     .poll    = dev_poll,
 };
 
-/* ──────────────────────────────────────────────
- * /proc/kb_stats — analytics report
- * ────────────────────────────────────────────── */
+
+// /proc/kb_stats — analytics report
 
 /* Linux keycode → printable name (sparse; only common keys shown) */
 static const char *keyname(unsigned int code)
@@ -558,7 +480,7 @@ static int stats_show(struct seq_file *m, void *v)
     seq_puts(m, "=== Keyboard Analytics Report ===\n\n");
     seq_printf(m, "Total key presses : %lu\n", total);
 
-    /* Typing speed in keys-per-minute */
+    // Typing speed in keys-per-minute
     if (count > 1) {
         unsigned long avg_us = sum_us / (count - 1);
         unsigned long kpm    = (avg_us > 0) ? (60000000UL / avg_us) : 0;
@@ -570,7 +492,7 @@ static int stats_show(struct seq_file *m, void *v)
 
     seq_printf(m, "Hotkey combos     : %lu\n\n", hkcount);
 
-    /* Top-10 most-used keys */
+    // Top-10 most-used keys
     seq_puts(m, "--- Most-Used Keys (top 10) ---\n");
     {
         /* Simple selection sort over sparse array */
@@ -632,16 +554,14 @@ static const struct proc_ops stats_fops = {
     .proc_release = single_release,
 };
 
-/* ──────────────────────────────────────────────
- * Module init / exit
- * ────────────────────────────────────────────── */
+// Module init / exit
 static int __init kb_module_init(void)
 {
     int ret;
 
     pr_info("kb_analytics: loading module\n");
 
-    /* 1. Allocate character device region */
+    // 1. Allocate character device region
     ret = alloc_chrdev_region(&kb_dev, 0, 1, DEVICE_NAME);
     if (ret < 0) {
         pr_err("kb_analytics: alloc_chrdev_region failed: %d\n", ret);
@@ -649,7 +569,7 @@ static int __init kb_module_init(void)
     }
     major_number = MAJOR(kb_dev);
 
-    /* 2. Init and add cdev */
+    // 2. Init and add cdev
     cdev_init(&kb_cdev, &fops);
     kb_cdev.owner = THIS_MODULE;
     ret = cdev_add(&kb_cdev, kb_dev, 1);
@@ -658,7 +578,7 @@ static int __init kb_module_init(void)
         goto err_region;
     }
 
-    /* 3. Create device class and device node */
+    // 3. Create device class and device node
     kb_class = class_create(CLASS_NAME);
     if (IS_ERR(kb_class)) {
         ret = PTR_ERR(kb_class);
@@ -673,21 +593,21 @@ static int __init kb_module_init(void)
         goto err_class;
     }
 
-    /* 4. Register USB driver */
+    // 4. Register USB driver
     ret = usb_register(&kb_usb_driver);
     if (ret) {
         pr_err("kb_analytics: usb_register failed: %d\n", ret);
         goto err_device;
     }
 
-    /* 5. Register input handler */
+    // 5. Register input handler
     ret = input_register_handler(&kb_handler);
     if (ret) {
         pr_err("kb_analytics: input_register_handler failed: %d\n", ret);
         goto err_usb;
     }
 
-    /* 6. Create /proc/kb_stats */
+    // 6. Create /proc/kb_stats
     if (!proc_create("kb_stats", 0444, NULL, &stats_fops)) {
         pr_err("kb_analytics: proc_create failed\n");
         ret = -ENOMEM;

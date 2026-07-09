@@ -20,7 +20,7 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config 
 PROC_STATS   = "/proc/kb_stats"
 CERT_FILE    = "certs/server.crt"
 KEY_FILE     = "certs/server.key"
@@ -28,7 +28,7 @@ HOST         = "0.0.0.0"
 PORT         = 5000
 POLL_INTERVAL = 2  # seconds between /proc reads
 
-# ── In-memory stats store (never touches disk) ────────────────────────────────
+# In-memory stats store (never touches disk)
 _stats_lock = threading.Lock()
 _latest     = {
     "total_keypresses": 0,
@@ -41,7 +41,7 @@ _latest     = {
     "module_loaded":    False,
 }
 
-# ── Background poller: reads /proc/kb_stats every POLL_INTERVAL seconds ───────
+# Background poller: reads /proc/kb_stats every POLL_INTERVAL seconds
 def parse_proc_stats(raw: str) -> dict:
     data = {
         "total_keypresses": 0,
@@ -115,7 +115,7 @@ def stats_poller():
         time.sleep(POLL_INTERVAL)
 
 
-# ── HTTP request handler ──────────────────────────────────────────────────────
+# HTTP request handler
 class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -152,8 +152,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-
-# ── Dashboard HTML (single-file, no external dependencies except CDN) ─────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -436,7 +434,7 @@ setInterval(fetchStats, 2000);
 """
 
 
-# ── TLS setup + server start ──────────────────────────────────────────────────
+# TLS setup + server start
 def main():
     print("=" * 55)
     print("  KB Analytics — TLS Dashboard Server")
