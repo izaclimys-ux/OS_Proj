@@ -44,6 +44,7 @@ sudo apt install -y raspberrypi-kernel-headers build-essential gcc
 cd kb_analytics/
 
 # 2. Run the automation script (builds, loads, demos everything)
+chmod +x run.sh gen_certs.sh
 sudo ./run.sh
 ```
 
